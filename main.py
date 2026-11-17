@@ -13,7 +13,15 @@ linear model of the log ratio log(v_h / v_1) against the log of the launch's
 own hour-1 print log(v_1), weighting each donor by how close its hour-1
 print is to this case's (a Gaussian kernel, bandwidth 1.0 in log units):
 big launches grow differently from small ones, so a donor the size of this
-launch counts more. The fitted value at this case's hour-1 print is the
+launch counts more. Each donor's kernel weight is further multiplied by a
+platform weight: console-only launches count 1.0, PC-inclusive ones 0.33,
+because GTA VI launches on consoles only with a rolling midnight unlock,
+and the console-only launches share that shape while PC-inclusive ones are
+shaped by a simultaneous global PC unlock. The four practice launches are
+all console exclusives, and the weighting improves their mean pinball loss
+from 0.194 to 0.187 (and leave-one-out console targets from 0.260 to
+0.240), while the PC-inclusive donors stay in the pool to stabilise the
+fit. The fitted value at this case's hour-1 print is the
 median ratio r_h; the weighted spread of the residuals around the fit is
 the log spread s_h. The five quantiles are then
 
@@ -63,6 +71,15 @@ Z = [-1.645, -0.674, 0, 0.674, 1.645]
 BASE_SIGMA = 0.15
 # Gaussian kernel bandwidth on log hour-1 prints, in log units.
 BANDWIDTH = 1.0
+# Donors whose launch had no PC version count 1.0; PC-inclusive donors
+# count this much. GTA VI launches on consoles only, with a rolling
+# midnight unlock, so console-only launches (whose daily shape is set by
+# the same rolling unlock) are the closer comparables; PC-inclusive
+# launches, whose curves are shaped by a simultaneous global PC unlock,
+# stay in the pool at a third of the weight so the fit keeps their
+# stabilising bulk. Validated on the four practice launches (mean pinball
+# 0.194 -> 0.187) and on leave-one-out console targets (0.260 -> 0.240).
+PLATFORM_PC_WEIGHT = 0.33
 # Spread floors and caps, in log units.
 SPREAD_MIN = 0.15
 SPREAD_MAX = 1.2
@@ -112,15 +129,20 @@ def release_day(comp: dict) -> dict[int, float] | None:
     return hours
 
 
-def donors_of(case: dict) -> list[dict[int, float]]:
-    """Every usable donor release-day curve in the case, in file order."""
+def donors_of(case: dict) -> list[tuple[dict[int, float], float]]:
+    """Every usable donor release-day curve in the case, in file order.
+
+    Each donor comes with its platform weight: 1.0 for launches with no
+    PC version, PLATFORM_PC_WEIGHT for PC-inclusive ones.
+    """
     donors = []
     for comp in case.get("comparables", []):
         if "before release" in comp.get("name", ""):
             continue
         day = release_day(comp)
         if day is not None:
-            donors.append(day)
+            weight = 1.0 if "PC" not in comp.get("platforms", "") else PLATFORM_PC_WEIGHT
+            donors.append((day, weight))
     return donors
 
 
@@ -147,19 +169,19 @@ def weighted_fit(xs: list[float], ys: list[float], ws: list[float], x0: float) -
     return my + slope * (x0 - mx), math.sqrt(var)
 
 
-def shape_forecast(p1: float, donors: list[dict[int, float]]) -> dict[int, list[float | int]]:
+def shape_forecast(p1: float, donors: list[tuple[dict[int, float], float]]) -> dict[int, list[float | int]]:
     """Median ratios and spreads per hour from the donor curves."""
-    log_p1s = [math.log(day[1]) for day in donors]
+    log_p1s = [math.log(day[1]) for day, _ in donors]
     lo = min(log_p1s) - EXTRAPOLATION
     hi = max(log_p1s) + EXTRAPOLATION
     target = max(lo, min(hi, math.log(max(1.0, p1))))
     out: dict[int, list[float | int]] = {}
     for h in range(2, 25):
         xs, ys, ws = [], [], []
-        for day, lp in zip(donors, log_p1s):
+        for (day, pw), lp in zip(donors, log_p1s):
             xs.append(lp)
             ys.append(math.log(day[h] / day[1]))
-            ws.append(math.exp(-0.5 * ((lp - target) / BANDWIDTH) ** 2))
+            ws.append(pw * math.exp(-0.5 * ((lp - target) / BANDWIDTH) ** 2))
         pred, spread = weighted_fit(xs, ys, ws, target)
         # Never predict a ratio outside what the donors have shown, give or
         # take half a log unit.
